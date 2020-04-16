@@ -1,4 +1,5 @@
-FROM centos:8
+# syntax=docker/dockerfile:1
+FROM centos:8 AS base
 #FROM registry.access.redhat.com/ubi8:8.1
 LABEL maintainer "thomasmckay@redhat.com"
 
@@ -11,101 +12,108 @@ ENV OS=linux \
     LC_ALL=C.UTF-8 \
     LANG=C.UTF-8 \
     PIP_NO_CACHE_DIR=off
-
+# This is the magic that lets us just copy out all of our installed python
+# packages later.
+ENV PYTHONUSERBASE=/opt/quay
 ENV QUAYDIR /quay-registry
 ENV QUAYCONF /quay-registry/conf
 ENV QUAYPATH "."
-
-RUN mkdir $QUAYDIR
 WORKDIR $QUAYDIR
 
-RUN INSTALL_PKGS="\
-        python3 \
-        nginx \
-        openldap \
-        gcc-c++ git \
-        openldap-devel \
-        python3-devel \
-        python3-gpg \
-        dnsmasq \
-        memcached \
-        openssl \
-        skopeo \
-        " && \
-    yum -y --setopt=tsflags=nodocs --setopt=skip_missing_names_on_install=False install $INSTALL_PKGS && \
-    yum -y update && \
+# Don't run yum update, pull the base image to update.
+RUN yum -y --setopt=tsflags=nodocs --setopt=skip_missing_names_on_install=False install\
+        python3\
+        nginx\
+        openldap\
+        python3-gpg\
+        dnsmasq\
+        memcached\
+        openssl\
+        skopeo\
+	 && \
     yum -y clean all
+RUN alternatives --set python /usr/bin/python3
 
-COPY . .
+FROM base AS build
+# Trade a bit of startup time for space.
+ENV PYTHONDONTWRITEBYTECODE 1
 
-RUN alternatives --set python /usr/bin/python3 && \
-    python -m pip install --upgrade setuptools pip && \
-    python -m pip install -r requirements.txt --no-cache && \
-    python -m pip freeze && \
-    mkdir -p $QUAYDIR/static/webfonts && \
-    mkdir -p $QUAYDIR/static/fonts && \
-    mkdir -p $QUAYDIR/static/ldn && \
-    PYTHONPATH=$QUAYPATH python -m external_libraries && \
-    cp -r $QUAYDIR/static/ldn $QUAYDIR/config_app/static/ldn && \
-    cp -r $QUAYDIR/static/fonts $QUAYDIR/config_app/static/fonts && \
-    cp -r $QUAYDIR/static/webfonts $QUAYDIR/config_app/static/webfonts
+RUN curl --silent --location https://rpm.nodesource.com/setup_12.x | bash -
+RUN curl --silent --location https://dl.yarnpkg.com/rpm/yarn.repo > /etc/yum.repos.d/yarn.repo &&\
+    rpm --import https://dl.yarnpkg.com/rpm/pubkey.gpg
+RUN dnf install -y\
+	gcc-c++\
+	git\
+	nodejs\
+	openldap-devel\
+	python3-devel\
+	yarn\
+	;
+RUN python3 -m pip install --user --upgrade setuptools pip
 
-RUN curl --silent --location https://rpm.nodesource.com/setup_12.x | bash - && \
-    yum install -y nodejs && \
-    curl --silent --location https://dl.yarnpkg.com/rpm/yarn.repo | tee /etc/yum.repos.d/yarn.repo && \
-    rpm --import https://dl.yarnpkg.com/rpm/pubkey.gpg && \
-    yum install -y yarn && \
-    yarn install --ignore-engines && \
-    yarn build && \
-    yarn build-config-app
+# The basic strategy here is to break the steps into the smallest complete
+# units, then put the bits that change the least frequently earlier.
+FROM build AS build-static
+WORKDIR /build
+RUN mkdir -p static/{webfonts,fonts,ldn}
+COPY external_libraries.py _init.py .
+RUN PYTHONPATH=$QUAYPATH python3 -m external_libraries
 
+FROM build AS build-deps
+WORKDIR /build
+COPY requirements.txt .
+RUN python3 -m pip install --user -r requirements.txt --no-cache --no-warn-script-location
 
-ENV JWTPROXY_VERSION=0.0.3
-RUN curl -fsSL -o /usr/local/bin/jwtproxy "https://github.com/coreos/jwtproxy/releases/download/v${JWTPROXY_VERSION}/jwtproxy-${OS}-${ARCH}" && \
-    chmod +x /usr/local/bin/jwtproxy
+COPY *.json *.js yarn.lock .
+RUN yarn install --ignore-engines
+COPY static static
+RUN yarn build
+COPY config_app config_app
+RUN yarn build-config-app
 
-ENV PUSHGATEWAY_VERSION=1.0.0
-RUN curl -fsSL "https://github.com/prometheus/pushgateway/releases/download/v${PUSHGATEWAY_VERSION}/pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}.tar.gz" | \
-    tar xz "pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}/pushgateway" && \
-    mv "pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}/pushgateway" /usr/local/bin/pushgateway && \
-    rm -rf "pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}" && \
-    chmod +x /usr/local/bin/pushgateway
+FROM build AS build-jwtproxy
+ARG JWTPROXY_VERSION=0.0.3
+RUN curl -fsSL -o jwtproxy "https://github.com/coreos/jwtproxy/releases/download/v${JWTPROXY_VERSION}/jwtproxy-${OS}-${ARCH}" &&\
+	install -d /usr/local/bin && install jwtproxy /usr/local/bin
 
-# Update local copy of AWS IP Ranges.
-RUN curl -fsSL https://ip-ranges.amazonaws.com/ip-ranges.json -o util/ipresolver/aws-ip-ranges.json
+FROM build AS build-pushgateway
+ARG PUSHGATEWAY_VERSION=1.0.0
+RUN curl -fsSL "https://github.com/prometheus/pushgateway/releases/download/v${PUSHGATEWAY_VERSION}/pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}.tar.gz" |\
+    tar xzO "pushgateway-${PUSHGATEWAY_VERSION}.${OS}-${ARCH}/pushgateway" >pushgateway &&\
+	install -d /usr/local/bin && install pushgateway /usr/local/bin
 
-RUN ln -s $QUAYCONF /conf && \
-    ln -sf /dev/stdout /var/log/nginx/access.log && \
-    ln -sf /dev/stdout /var/log/nginx/error.log && \
-    chmod -R a+rwx /var/log/nginx
-
-# Cleanup
-RUN UNINSTALL_PKGS="\
-        gcc-c++ git \
-        openldap-devel \
-        gpgme-devel \
-        python3-devel \
-        optipng \
-        kernel-headers \
-        " && \
-    yum remove -y $UNINSTALL_PKGS && \
-    yum clean all && \
-    rm -rf /var/cache/yum /tmp/* /var/tmp/* /root/.cache
-
-EXPOSE 8080 8443 7443 9091
+FROM base AS final
+COPY --from=build-static /build/static/webfonts $QUAYDIR/static/webfonts
+COPY --from=build-static /build/static/fonts $QUAYDIR/static/fonts
+COPY --from=build-static /build/static/ldn $QUAYDIR/static/ldn
+COPY --from=build-static /build/static/webfonts $QUAYDIR/config_app/static/webfonts
+COPY --from=build-static /build/static/fonts $QUAYDIR/config_app/static/fonts
+COPY --from=build-static /build/static/ldn $QUAYDIR/config_app/static/ldn
+COPY --from=build-jwtproxy /usr/local/bin/jwtproxy /usr/local/bin/jwtproxy
+COPY --from=build-pushgateway /usr/local/bin/pushgateway /usr/local/bin/pushgateway
+COPY --from=build-deps $PYTHONUSERBASE $PYTHONUSERBASE
+COPY --from=build-deps /build $QUAYDIR
 
 RUN chgrp -R 0 $QUAYDIR && \
     chmod -R g=u $QUAYDIR
-
 RUN mkdir /datastorage && chgrp 0 /datastorage && chmod g=u /datastorage && \
     chgrp 0 /var/log/nginx && chmod g=u /var/log/nginx && \
     mkdir -p /conf/stack && chgrp 0 /conf/stack && chmod g=u /conf/stack && \
     mkdir -p /tmp && chgrp 0 /tmp && chmod g=u /tmp && \
     mkdir /certificates && chgrp 0 /certificates && chmod g=u /certificates && \
     chmod g=u /etc/passwd
+RUN ln -s $QUAYCONF /conf && \
+    ln -sf /dev/stdout /var/log/nginx/access.log && \
+    ln -sf /dev/stdout /var/log/nginx/error.log && \
+    chmod -R a+rwx /var/log/nginx
 
+COPY . .
+# Update local copy of AWS IP Ranges.
+ADD https://ip-ranges.amazonaws.com/ip-ranges.json util/ipresolver/aws-ip-ranges.json
+
+ENV PATH=$PYTHONUSERBASE/bin:$PATH
+EXPOSE 8080 8443 7443 9091
 VOLUME ["/var/log", "/datastorage", "/tmp", "/conf/stack"]
-
 ENTRYPOINT ["/quay-registry/quay-entrypoint.sh"]
 CMD ["registry"]
 

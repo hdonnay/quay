@@ -6,7 +6,6 @@ import os
 import hashlib
 
 from _init import STATIC_FONTS_DIR, STATIC_WEBFONTS_DIR, STATIC_LDN_DIR
-from util.log import logfile_path
 
 
 LOCAL_PATH = "/static/ldn/"
@@ -124,7 +123,7 @@ def _download_url(url):
 
 
 if __name__ == "__main__":
-    logging.config.fileConfig(logfile_path(debug=False), disable_existing_loggers=False)
+    #logging.config.fileConfig(logfile_path(debug=False), disable_existing_loggers=False)
 
     resources = [
         (STATIC_LDN_DIR, EXTERNAL_JS + EXTERNAL_CSS, True),
